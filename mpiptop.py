@@ -349,6 +349,28 @@ def parse_python_selector(args: str) -> ProgramSelector:
     return ProgramSelector(module=module, script=script, display=display)
 
 
+def selector_score(selector: ProgramSelector) -> Tuple[int, int, int, int]:
+    if not selector.display:
+        return (0, 0, 0, 0)
+    has_script = 1 if selector.script else 0
+    has_module = 1 if selector.module else 0
+    display = f" {selector.display} "
+    has_python_target = 1 if ".py" in selector.display or " -m " in display else 0
+    return (has_script, has_module, has_python_target, len(selector.display))
+
+
+def best_selector_from_procs(procs: Iterable[RankProcess]) -> Optional[ProgramSelector]:
+    best: Optional[ProgramSelector] = None
+    best_score = selector_score(best or ProgramSelector(module=None, script=None, display=""))
+    for proc in procs:
+        candidate = parse_python_selector(proc.cmdline)
+        score = selector_score(candidate)
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
 def extract_python_exe(cmdline: str) -> Optional[str]:
     if not cmdline:
         return None
@@ -1110,11 +1132,8 @@ def build_header(
     state: State, last_update: str, errors: List[str], refresh: int, width: int
 ) -> Tuple[Text, int]:
     program_lines = wrap_program_lines(state.selector, width)
-    if program_lines:
-        last_line = program_lines[-1]
-        last_line.append(f" | ranks: {len(state.ranks)} | rankfile: {state.rankfile}")
-    else:
-        program_lines = [Text(f"python | ranks: {len(state.ranks)} | rankfile: {state.rankfile}")]
+    if not program_lines:
+        program_lines = [Text("python")]
 
     controls_plain = "q quit | space refresh | t threads | d details"
     padding = max(0, width - len(controls_plain))
@@ -1339,8 +1358,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     next_refresh = 0.0
 
     def refresh_view() -> None:
-        nonlocal last_update
+        nonlocal last_update, state
         rank_to_proc, pid_errors = collect_rank_pids(state)
+        candidate = best_selector_from_procs(rank_to_proc.values())
+        if candidate and selector_score(candidate) > selector_score(state.selector):
+            state = dataclasses.replace(state, selector=candidate)
         stacks, details_by_rank, stack_errors = collect_stacks(
             state, rank_to_proc, pythonpath, show_threads, install_attempted
         )
