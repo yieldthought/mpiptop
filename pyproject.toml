@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpiptop"
+version = "0.1.0"
+description = "TUI for viewing MPI Python stacks across hosts"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "yieldthought" }]
+keywords = ["mpi", "tui", "py-spy", "distributed", "debugging"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "rich>=13.7",
+    "py-spy>=0.4.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/yieldthought/mpiptop"
+Repository = "https://github.com/yieldthought/mpiptop"
+
+[project.scripts]
+mpiptop = "mpiptop:main"
+
+[tool.setuptools]
+py-modules = ["mpiptop"]
