@@ -30,6 +30,17 @@ mpiptop --rankfile /etc/mpirun/rankfile_01_02
 mpiptop --prterun-pid 12345
 mpiptop --refresh 5
 mpiptop --pythonpath /path/to/your/code
+mpiptop record --out ./mpiptop-session-20260123-120000.jsonl
 ```
 
-Controls: `q` quit | `space` refresh | `t` threads | `d` details
+Record/review (record is batch mode; use plain `mpiptop` for the TUI):
+```bash
+mpiptop record
+mpiptop record --quiet
+mpiptop review ./mpiptop-session-20260123-120000.jsonl
+mpiptop summarize ./mpiptop-session-20260123-120000.jsonl --format text
+```
+
+Live controls: `q` quit | `space` refresh | `t` threads | `d` details | `r` record
+
+Review controls: `q` quit | `left/right` move | `down` zoom | `up` zoom out | `t` threads | `d` details

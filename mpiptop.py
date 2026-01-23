@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import colorsys
 import dataclasses
+import datetime
 import hashlib
 import json
 import os
@@ -79,10 +80,40 @@ class ParsedPySpy:
     threads: List[ThreadBlock]
 
 
+@dataclasses.dataclass(frozen=True)
+class RankSnapshot:
+    output: Optional[str]
+    error: Optional[str]
+    stack_lines: List[str]
+    details: List[str]
+
+
+@dataclasses.dataclass
+class SessionEvent:
+    timestamp: float
+    ranks: Dict[int, Dict[str, object]]
+
+
+@dataclasses.dataclass
+class TimelineLevel:
+    start: int
+    end: int
+    selected: int = 0
+    buckets: List[Tuple[int, int]] = dataclasses.field(default_factory=list)
+
+
 PUNCT_STYLE = "grey62"
 BORDER_STYLE = "grey62"
 KEY_STYLE = "#7ad7ff"
 HEADER_HEIGHT = 3
+SESSION_VERSION = 1
+SESSION_LOG_FILE = "session.jsonl"
+SESSION_METADATA_FILE = "metadata.json"
+SESSION_EVENTS_FILE = "events.jsonl"
+SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
+HEARTBEAT_INTERVAL = 60
+DIVERGENCE_THRESHOLD = 0.5
+DIVERGENCE_INTERVAL = 60
 ENV_KEYS = (
     "PATH",
     "LD_LIBRARY_PATH",
@@ -202,6 +233,264 @@ for pid in os.listdir("/proc"):
 print(json.dumps(results))
 """
 
+
+def iso_timestamp(value: Optional[float] = None) -> str:
+    ts = time.time() if value is None else value
+    return datetime.datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+
+
+def default_session_path() -> str:
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.abspath(f"mpiptop-session-{stamp}.jsonl")
+
+
+def normalize_session_path(path: str) -> Tuple[str, str]:
+    if path.endswith(".jsonl") or (os.path.exists(path) and os.path.isfile(path)):
+        base_dir = os.path.dirname(path) or "."
+        return base_dir, path
+    return path, os.path.join(path, SESSION_LOG_FILE)
+
+
+def ensure_session_path(path: str) -> Tuple[str, str]:
+    base_dir, log_path = normalize_session_path(path)
+    if os.path.exists(path):
+        if os.path.isdir(path):
+            if os.listdir(path):
+                if os.path.exists(log_path) or os.path.exists(os.path.join(path, SESSION_METADATA_FILE)):
+                    return base_dir, log_path
+                raise SystemExit(f"record path exists and is not empty: {path}")
+        elif os.path.isfile(path):
+            return base_dir, log_path
+        else:
+            raise SystemExit(f"record path exists and is not a file or directory: {path}")
+    else:
+        if log_path.endswith(".jsonl"):
+            os.makedirs(base_dir, exist_ok=True)
+        else:
+            os.makedirs(base_dir, exist_ok=True)
+    return base_dir, log_path
+
+
+def write_session_metadata(log_path: str, state: State, refresh: int, pythonpath: str) -> None:
+    payload = {
+        "version": SESSION_VERSION,
+        "created_at": iso_timestamp(),
+        "refresh": refresh,
+        "rankfile": state.rankfile,
+        "prte_pid": state.prte_pid,
+        "selector": dataclasses.asdict(state.selector),
+        "ranks": [dataclasses.asdict(rank) for rank in state.ranks],
+        "pythonpath": pythonpath,
+        "record_on_change": True,
+    }
+    if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
+        return
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "metadata", "data": payload}) + "\n")
+
+
+def load_session_metadata(path: str) -> Dict[str, object]:
+    base_dir, log_path = normalize_session_path(path)
+    metadata_path = os.path.join(base_dir, SESSION_METADATA_FILE)
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    if not os.path.exists(log_path):
+        raise SystemExit(f"metadata not found in {path}")
+    with open(log_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("type") == "metadata":
+                payload = data.get("data")
+                if isinstance(payload, dict):
+                    return payload
+            if isinstance(data, dict) and "version" in data and "ranks" in data:
+                return data
+    raise SystemExit(f"metadata not found in {log_path}")
+
+
+def read_last_event(path: str) -> Optional[Dict[str, object]]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        pos = handle.tell()
+        if pos == 0:
+            return None
+        chunk = b""
+        while pos > 0:
+            step = min(4096, pos)
+            pos -= step
+            handle.seek(pos)
+            chunk = handle.read(step) + chunk
+            if b"\n" in chunk:
+                break
+        lines = [line for line in chunk.splitlines() if line.strip()]
+        while lines:
+            raw = lines.pop().decode("utf-8", errors="ignore")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and data.get("type") == "metadata":
+                continue
+            if isinstance(data, dict) and data.get("type") == "event":
+                payload = data.get("data")
+                if isinstance(payload, dict):
+                    return payload
+            return data
+        return None
+
+
+def load_session_events(path: str) -> List[SessionEvent]:
+    base_dir, log_path = normalize_session_path(path)
+    events_path = os.path.join(base_dir, SESSION_EVENTS_FILE)
+    if not os.path.exists(events_path) and not os.path.exists(log_path):
+        raise SystemExit(f"events not found in {path}")
+    path_to_read = events_path if os.path.exists(events_path) else log_path
+    events: List[SessionEvent] = []
+    with open(path_to_read, "r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("type") == "metadata":
+                continue
+            if isinstance(data, dict) and data.get("type") == "event":
+                data = data.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            timestamp = float(data.get("t", 0.0))
+            ranks_raw = data.get("ranks", {})
+            ranks: Dict[int, Dict[str, object]] = {}
+            for key, value in ranks_raw.items():
+                try:
+                    rank_id = int(key)
+                except (TypeError, ValueError):
+                    continue
+                ranks[rank_id] = value
+            events.append(SessionEvent(timestamp=timestamp, ranks=ranks))
+    return events
+
+
+def signature_from_snapshot(snapshot: Optional[RankSnapshot]) -> str:
+    if snapshot is None:
+        return "missing"
+    if snapshot.error:
+        return f"error:{snapshot.error}"
+    if snapshot.output is None:
+        return "missing"
+    digest = hashlib.sha1(snapshot.output.encode("utf-8", errors="ignore")).hexdigest()
+    return digest
+
+
+def snapshot_signature(ranks: List[RankInfo], snapshots: Dict[int, RankSnapshot]) -> Dict[int, str]:
+    signature: Dict[int, str] = {}
+    for info in ranks:
+        signature[info.rank] = signature_from_snapshot(snapshots.get(info.rank))
+    return signature
+
+
+def signature_from_event(event: Dict[str, object]) -> Optional[Dict[int, str]]:
+    ranks = event.get("ranks", {})
+    if not isinstance(ranks, dict):
+        return None
+    signature: Dict[int, str] = {}
+    for key, payload in ranks.items():
+        try:
+            rank_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            signature[rank_id] = "missing"
+            continue
+        if payload.get("error"):
+            signature[rank_id] = f"error:{payload.get('error')}"
+        elif payload.get("py_spy"):
+            digest = hashlib.sha1(
+                str(payload.get("py_spy")).encode("utf-8", errors="ignore")
+            ).hexdigest()
+            signature[rank_id] = digest
+        else:
+            signature[rank_id] = "missing"
+    return signature
+
+
+class RecordSession:
+    def __init__(self, path: str, state: State, refresh: int, pythonpath: str):
+        self.base_dir, self.log_path = ensure_session_path(path)
+        write_session_metadata(self.log_path, state, refresh, pythonpath)
+        self.handle = open(self.log_path, "a", encoding="utf-8")
+        self.event_count = 0
+        self.last_signature: Optional[Dict[int, str]] = None
+        last_event = read_last_event(self.log_path)
+        if last_event:
+            self.last_signature = signature_from_event(last_event)
+            self.event_count = self._count_events()
+
+    def _count_events(self) -> int:
+        if not os.path.exists(self.log_path):
+            return 0
+        count = 0
+        with open(self.log_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict) and data.get("type") == "metadata":
+                    continue
+                count += 1
+        return count
+
+    def record_if_changed(
+        self,
+        state: State,
+        rank_to_proc: Dict[int, RankProcess],
+        snapshots: Dict[int, RankSnapshot],
+    ) -> bool:
+        signature = snapshot_signature(state.ranks, snapshots)
+        if self.last_signature is not None and signature == self.last_signature:
+            return False
+        payload: Dict[str, object] = {"t": time.time(), "ranks": {}}
+        ranks_payload: Dict[str, object] = {}
+        for info in state.ranks:
+            rank = info.rank
+            proc = rank_to_proc.get(rank)
+            snapshot = snapshots.get(rank)
+            entry: Dict[str, object] = {"host": info.host}
+            if proc is not None:
+                entry["pid"] = proc.pid
+                entry["cmdline"] = proc.cmdline
+                entry["rss_kb"] = proc.rss_kb
+            if snapshot is None:
+                entry["error"] = "No data"
+            elif snapshot.error:
+                entry["error"] = snapshot.error
+            elif snapshot.output is not None:
+                entry["py_spy"] = snapshot.output
+            else:
+                entry["error"] = "No data"
+            ranks_payload[str(rank)] = entry
+        payload["ranks"] = ranks_payload
+        self.handle.write(json.dumps({"type": "event", "data": payload}) + "\n")
+        self.handle.flush()
+        self.last_signature = signature
+        self.event_count += 1
+        return True
+
+    def close(self) -> None:
+        try:
+            self.handle.close()
+        except Exception:
+            pass
 
 def read_ps() -> List[Proc]:
     result = subprocess.run(
@@ -1134,6 +1423,9 @@ def build_header(
     program_lines = wrap_program_lines(state.selector, width)
     if not program_lines:
         program_lines = [Text("python")]
+    for line in program_lines:
+        line.no_wrap = True
+        line.overflow = "crop"
 
     controls_plain = "q quit | space refresh | t threads | d details"
     padding = max(0, width - len(controls_plain))
@@ -1155,6 +1447,8 @@ def build_header(
         text.append_text(line)
     text.append("\n")
     text.append_text(line2)
+    text.no_wrap = True
+    text.overflow = "crop"
     return text, len(program_lines) + 1
 
 
@@ -1246,6 +1540,338 @@ def build_details_text(
     return output
 
 
+def format_elapsed(start: Optional[float]) -> str:
+    if start is None:
+        return "0:00"
+    elapsed = max(0, int(time.time() - start))
+    return format_duration(elapsed)
+
+
+def format_duration(elapsed: int) -> str:
+    hours = elapsed // 3600
+    minutes = (elapsed % 3600) // 60
+    seconds = elapsed % 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def build_live_header(
+    state: State,
+    last_update: str,
+    refresh: int,
+    record_line: Optional[str],
+    width: int,
+) -> Tuple[Text, int]:
+    program_lines = wrap_program_lines(state.selector, width)
+    if not program_lines:
+        program_lines = [Text("python")]
+    for line in program_lines:
+        line.no_wrap = True
+        line.overflow = "crop"
+
+    record_text = None
+    if record_line:
+        record_text = Text()
+        record_text.append("REC", style="bold red")
+        record_text.append(" recording: ")
+        record_text.append(record_line)
+        record_text.truncate(width)
+        record_text.no_wrap = True
+        record_text.overflow = "crop"
+
+    controls_plain = "q quit | space refresh | t threads | d details | r record"
+    padding = max(0, width - len(controls_plain))
+    controls_line = Text(" " * padding + controls_plain)
+    for token in ["q", "space", "t", "d", "r"]:
+        start = controls_plain.find(token)
+        if start != -1:
+            controls_line.stylize(KEY_STYLE, padding + start, padding + start + len(token))
+    controls_line.truncate(width)
+    controls_line.no_wrap = True
+    controls_line.overflow = "crop"
+
+    text = Text()
+    for idx, line in enumerate(program_lines):
+        if idx:
+            text.append("\n")
+        text.append_text(line)
+    text.append("\n")
+    if record_text is not None:
+        text.append_text(record_text)
+        text.append("\n")
+    text.append_text(controls_line)
+    text.no_wrap = True
+    text.overflow = "crop"
+    extra_lines = 2 if record_text is not None else 1
+    return text, len(program_lines) + extra_lines
+
+
+def build_review_header(
+    state: State,
+    event_index: int,
+    event_total: int,
+    event_time: str,
+    timeline_lines: List[Text],
+    width: int,
+) -> Tuple[Text, int]:
+    program_lines = wrap_program_lines(state.selector, width)
+    if not program_lines:
+        program_lines = [Text("python")]
+    status_line = Text(
+        f"review {event_index + 1}/{event_total} | {event_time}"
+    )
+    status_line.truncate(width)
+
+    controls_plain = "q quit | left/right move | down zoom | up zoom out | t threads | d details"
+    padding = max(0, width - len(controls_plain))
+    controls_line = Text(" " * padding + controls_plain)
+    for token in ["q", "left/right", "down", "up", "t", "d"]:
+        start = controls_plain.find(token)
+        if start != -1:
+            controls_line.stylize(KEY_STYLE, padding + start, padding + start + len(token))
+    controls_line.truncate(width)
+    controls_line.no_wrap = True
+    controls_line.overflow = "crop"
+
+    text = Text()
+    for idx, line in enumerate(program_lines):
+        if idx:
+            text.append("\n")
+        text.append_text(line)
+    text.append("\n")
+    text.append_text(status_line)
+    for line in timeline_lines:
+        text.append("\n")
+        text.append_text(line)
+    text.append("\n")
+    text.append_text(controls_line)
+    text.no_wrap = True
+    text.overflow = "crop"
+    return text, len(program_lines) + 1 + len(timeline_lines) + 1
+
+
+def build_buckets(start: int, end: int, width: int) -> List[Tuple[int, int]]:
+    count = max(0, end - start)
+    if count == 0:
+        return []
+    bucket_count = max(1, min(width, count))
+    base = count // bucket_count
+    remainder = count % bucket_count
+    buckets: List[Tuple[int, int]] = []
+    current = start
+    for idx in range(bucket_count):
+        size = base + (1 if idx < remainder else 0)
+        buckets.append((current, current + size))
+        current += size
+    return buckets
+
+
+def divergence_color(ratio: float) -> str:
+    clamped = min(1.0, max(0.0, ratio))
+    intensity = clamped ** 0.7
+    base = (170, 170, 170)
+    hot = (255, 122, 0)
+    r = int(base[0] + (hot[0] - base[0]) * intensity)
+    g = int(base[1] + (hot[1] - base[1]) * intensity)
+    b = int(base[2] + (hot[2] - base[2]) * intensity)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def compute_event_metrics(
+    events: List[SessionEvent],
+    ranks: List[RankInfo],
+    show_threads: bool,
+) -> Tuple[List[int], List[float], List[int]]:
+    max_stack_lens: List[int] = []
+    divergence_ratios: List[float] = []
+    common_prefixes: List[int] = []
+    for event in events:
+        stacks_by_rank: Dict[int, List[str]] = {}
+        for info in ranks:
+            payload = event.ranks.get(info.rank, {})
+            if payload.get("error"):
+                stacks_by_rank[info.rank] = []
+                continue
+            output = payload.get("py_spy")
+            if not output:
+                stacks_by_rank[info.rank] = []
+                continue
+            lines, _details = render_pyspy_output(str(output), show_threads)
+            stacks_by_rank[info.rank] = extract_stack_lines(lines)
+        max_len = max((len(stack) for stack in stacks_by_rank.values()), default=0)
+        common_len = common_prefix_length(stacks_by_rank)
+        similarity = float(common_len) / float(max_len) if max_len else 0.0
+        ratio = 1.0 - similarity if max_len else 0.0
+        max_stack_lens.append(max_len)
+        divergence_ratios.append(ratio)
+        common_prefixes.append(common_len)
+    return max_stack_lens, divergence_ratios, common_prefixes
+
+
+def render_timeline_lines(
+    levels: List[TimelineLevel],
+    max_stack_lens: List[int],
+    divergence_ratios: List[float],
+    width: int,
+) -> List[Text]:
+    lines: List[Text] = []
+    for level_index, level in enumerate(levels):
+        level.buckets = build_buckets(level.start, level.end, width)
+        if level.buckets:
+            level.selected = max(0, min(level.selected, len(level.buckets) - 1))
+        stats: List[Tuple[int, float]] = []
+        for start, end in level.buckets:
+            bucket_heights = max_stack_lens[start:end]
+            bucket_ratios = divergence_ratios[start:end]
+            height = max(bucket_heights) if bucket_heights else 0
+            ratio = max(bucket_ratios) if bucket_ratios else 0.0
+            stats.append((height, ratio))
+        max_height = max((height for height, _ in stats), default=1)
+        if max_height <= 0:
+            max_height = 1
+        text = Text()
+        for idx, (height, ratio) in enumerate(stats):
+            normalized = float(height) / float(max_height) if max_height else 0.0
+            level_idx = int(round(normalized * (len(SPARKLINE_CHARS) - 1)))
+            level_idx = max(0, min(level_idx, len(SPARKLINE_CHARS) - 1))
+            char = SPARKLINE_CHARS[level_idx]
+            style = divergence_color(ratio)
+            if idx == level.selected:
+                if level_index == len(levels) - 1:
+                    style = f"{style} bold underline"
+                else:
+                    style = f"{style} underline"
+            text.append(char, style=style)
+        text.no_wrap = True
+        text.overflow = "crop"
+        lines.append(text)
+    return lines
+
+
+def event_snapshots_from_event(
+    event: SessionEvent,
+    ranks: List[RankInfo],
+    show_threads: bool,
+) -> Dict[int, RankSnapshot]:
+    snapshots: Dict[int, RankSnapshot] = {}
+    for info in ranks:
+        payload = event.ranks.get(info.rank)
+        if not payload:
+            snapshots[info.rank] = RankSnapshot(
+                output=None,
+                error="No data",
+                stack_lines=["No data"],
+                details=[],
+            )
+            continue
+        if payload.get("error"):
+            snapshots[info.rank] = RankSnapshot(
+                output=None,
+                error=str(payload.get("error")),
+                stack_lines=[str(payload.get("error"))],
+                details=[],
+            )
+            continue
+        output = payload.get("py_spy")
+        if not output:
+            snapshots[info.rank] = RankSnapshot(
+                output=None,
+                error="No data",
+                stack_lines=["No data"],
+                details=[],
+            )
+            continue
+        lines, details = render_pyspy_output(str(output), show_threads)
+        snapshots[info.rank] = RankSnapshot(
+            output=str(output),
+            error=None,
+            stack_lines=lines,
+            details=details,
+        )
+    return snapshots
+
+
+def rank_to_proc_from_event(
+    event: SessionEvent,
+    ranks: List[RankInfo],
+) -> Dict[int, RankProcess]:
+    rank_to_proc: Dict[int, RankProcess] = {}
+    for info in ranks:
+        payload = event.ranks.get(info.rank)
+        if not payload:
+            continue
+        pid = payload.get("pid")
+        cmdline = payload.get("cmdline")
+        rss_kb = payload.get("rss_kb")
+        if pid is None or cmdline is None:
+            continue
+        try:
+            pid_value = int(pid)
+        except (TypeError, ValueError):
+            continue
+        rss_value = None
+        if rss_kb is not None:
+            try:
+                rss_value = int(rss_kb)
+            except (TypeError, ValueError):
+                rss_value = None
+        rank_to_proc[info.rank] = RankProcess(
+            pid=pid_value,
+            cmdline=str(cmdline),
+            rss_kb=rss_value,
+            python_exe=None,
+            env={},
+        )
+    return rank_to_proc
+
+
+def compute_divergence_from_snapshots(
+    ranks: List[RankInfo], snapshots: Dict[int, RankSnapshot]
+) -> Tuple[float, int, int]:
+    stack_lines_by_rank = {
+        info.rank: extract_stack_lines(snapshots.get(info.rank, RankSnapshot(None, "No data", [], [])).stack_lines)
+        for info in ranks
+    }
+    max_len = max((len(stack) for stack in stack_lines_by_rank.values()), default=0)
+    common_len = common_prefix_length(stack_lines_by_rank)
+    similarity = float(common_len) / float(max_len) if max_len else 0.0
+    divergence = 1.0 - similarity if max_len else 0.0
+    return divergence, common_len, max_len
+
+
+def read_key(timeout: float) -> Optional[str]:
+    if sys.stdin not in select_with_timeout(timeout):
+        return None
+    key = sys.stdin.read(1)
+    if key != "\x1b":
+        return key
+    seq = key
+    for _ in range(2):
+        if sys.stdin in select_with_timeout(0.01):
+            seq += sys.stdin.read(1)
+    if seq == "\x1b[A":
+        return "up"
+    if seq == "\x1b[B":
+        return "down"
+    if seq == "\x1b[C":
+        return "right"
+    if seq == "\x1b[D":
+        return "left"
+    return None
+
+
+def is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
 def detect_state(args: argparse.Namespace) -> State:
     procs = read_ps()
     prte = find_prterun(procs, args.prterun_pid)
@@ -1297,29 +1923,40 @@ def collect_stacks(
     pythonpath: str,
     show_threads: bool,
     install_attempted: set,
-) -> Tuple[Dict[int, List[str]], Dict[int, List[str]], List[str]]:
-    stacks: Dict[int, List[str]] = {}
-    details_by_rank: Dict[int, List[str]] = {}
+) -> Tuple[Dict[int, RankSnapshot], List[str]]:
+    snapshots: Dict[int, RankSnapshot] = {}
     errors: List[str] = []
     for entry in state.ranks:
         proc = rank_to_proc.get(entry.rank)
         if proc is None:
-            stacks[entry.rank] = ["No process"]
-            details_by_rank[entry.rank] = []
+            snapshots[entry.rank] = RankSnapshot(
+                output=None,
+                error="No process",
+                stack_lines=["No process"],
+                details=[],
+            )
             continue
         output, error = run_py_spy(entry.host, proc, pythonpath, install_attempted)
         if error:
             errors.append(error)
-            stacks[entry.rank] = [error]
-            details_by_rank[entry.rank] = []
+            snapshots[entry.rank] = RankSnapshot(
+                output=None,
+                error=error,
+                stack_lines=[error],
+                details=[],
+            )
             continue
         lines, details = render_pyspy_output(output or "", show_threads)
-        stacks[entry.rank] = lines
-        details_by_rank[entry.rank] = details
-    return stacks, details_by_rank, errors
+        snapshots[entry.rank] = RankSnapshot(
+            output=output,
+            error=None,
+            stack_lines=lines,
+            details=details,
+        )
+    return snapshots, errors
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_live_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Show MPI Python stacks across hosts.")
     parser.add_argument("--rankfile", help="Override rankfile path")
     parser.add_argument("--prterun-pid", type=int, help="PID of prterun/mpirun")
@@ -1328,11 +1965,61 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--pythonpath",
         help="PYTHONPATH to export remotely (defaults to local PYTHONPATH)",
     )
+    parser.add_argument(
+        "--out",
+        help="Output path for recordings (.jsonl file or directory)",
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+def parse_review_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Review a recorded mpiptop session.")
+    parser.add_argument("path", help="Path to a recorded session (.jsonl file or directory)")
+    return parser.parse_args(argv)
+
+
+def parse_summarize_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Summarize a recorded mpiptop session.")
+    parser.add_argument("path", help="Path to a recorded session (.jsonl file or directory)")
+    parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="Top signatures to report",
+    )
+    return parser.parse_args(argv)
+
+
+def parse_record_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Record an mpiptop session.")
+    parser.add_argument("--rankfile", help="Override rankfile path")
+    parser.add_argument("--prterun-pid", type=int, help="PID of prterun/mpirun")
+    parser.add_argument("--refresh", type=int, default=10, help="Refresh interval (seconds)")
+    parser.add_argument(
+        "--pythonpath",
+        help="PYTHONPATH to export remotely (defaults to local PYTHONPATH)",
+    )
+    parser.add_argument(
+        "--out",
+        help="Output path for recordings (.jsonl file or directory)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Only print start/stop lines",
+    )
+    args = parser.parse_args(argv)
+    args.record = True
+    return args
+
+
+def run_live(args: argparse.Namespace) -> int:
     pythonpath = args.pythonpath if args.pythonpath is not None else os.environ.get("PYTHONPATH", "")
 
     state = detect_state(args)
@@ -1341,6 +2028,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     show_threads = False
     show_details = False
     install_attempted: set = set()
+    record_session: Optional[RecordSession] = None
+    recording_enabled = bool(getattr(args, "record", False))
+    record_started_at: Optional[float] = None
+    record_path = args.out
 
     def handle_sigint(_sig, _frame):
         raise KeyboardInterrupt
@@ -1357,32 +2048,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     last_update = "never"
     next_refresh = 0.0
 
+    def start_recording() -> None:
+        nonlocal record_session, recording_enabled, record_started_at, record_path
+        if record_session is None:
+            record_path = record_path or default_session_path()
+            record_session = RecordSession(record_path, state, refresh, pythonpath)
+        recording_enabled = True
+        if record_started_at is None:
+            record_started_at = time.time()
+
+    def stop_recording() -> None:
+        nonlocal recording_enabled, record_started_at
+        recording_enabled = False
+        record_started_at = None
+
+    if recording_enabled:
+        start_recording()
+
     def refresh_view() -> None:
-        nonlocal last_update, state
-        rank_to_proc, pid_errors = collect_rank_pids(state)
+        nonlocal last_update, state, record_session
+        rank_to_proc, _pid_errors = collect_rank_pids(state)
         candidate = best_selector_from_procs(rank_to_proc.values())
         if candidate and selector_score(candidate) > selector_score(state.selector):
             state = dataclasses.replace(state, selector=candidate)
-        stacks, details_by_rank, stack_errors = collect_stacks(
+        snapshots, _stack_errors = collect_stacks(
             state, rank_to_proc, pythonpath, show_threads, install_attempted
         )
+        if recording_enabled and record_session is not None:
+            record_session.record_if_changed(state, rank_to_proc, snapshots)
         stacks_text: Dict[int, Text] = {}
-        stack_lines_by_rank = {rank: extract_stack_lines(lines) for rank, lines in stacks.items()}
+        stack_lines_by_rank = {
+            rank: extract_stack_lines(snapshot.stack_lines)
+            for rank, snapshot in snapshots.items()
+        }
         prefix_len = common_prefix_length(stack_lines_by_rank)
         diff_index = None
         if any(stack_lines_by_rank.values()):
-            if prefix_len > 0:
-                diff_index = prefix_len - 1
-            else:
-                diff_index = 0
-        for rank, lines in stacks.items():
+            diff_index = max(0, prefix_len - 1) if prefix_len > 0 else 0
+        for rank, snapshot in snapshots.items():
+            lines = snapshot.stack_lines
             marked = mark_diff_line(lines, diff_index) if diff_index is not None else lines
             stacks_text[rank] = style_lines(marked)
-        errors = pid_errors + stack_errors
+        details_by_rank = {
+            rank: snapshot.details for rank, snapshot in snapshots.items()
+        }
         last_update = time.strftime("%H:%M:%S")
         width, height = shutil.get_terminal_size((120, 40))
         content_width = max(0, width - 4)
-        header, header_lines = build_header(state, last_update, errors, refresh, content_width)
+        record_line = None
+        if record_session is not None and recording_enabled:
+            record_line = f"{record_session.log_path} | events {record_session.event_count} | {format_elapsed(record_started_at)}"
+            record_line = shorten(record_line, max(10, content_width - 12))
+        header, header_lines = build_live_header(
+            state, last_update, refresh, record_line, content_width
+        )
         header_height = header_lines + 2
         header_height = max(3, min(header_height, max(3, height - 1)))
         layout["header"].size = header_height
@@ -1412,24 +2131,396 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     refresh_view()
                     next_refresh = now + refresh
 
-                if sys.stdin in select_with_timeout(0.1):
-                    key = sys.stdin.read(1)
-                    if key == "q":
-                        return 0
-                    if key == " ":
-                        next_refresh = 0.0
-                    if key == "t":
-                        show_threads = not show_threads
-                        next_refresh = 0.0
-                    if key == "d":
-                        show_details = not show_details
-                        next_refresh = 0.0
+                key = read_key(0.1)
+                if key is None:
+                    continue
+                if key == "q":
+                    return 0
+                if key == " ":
+                    next_refresh = 0.0
+                if key == "t":
+                    show_threads = not show_threads
+                    next_refresh = 0.0
+                if key == "d":
+                    show_details = not show_details
+                    next_refresh = 0.0
+                if key == "r":
+                    if recording_enabled:
+                        stop_recording()
+                    else:
+                        start_recording()
+                    next_refresh = 0.0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if record_session is not None:
+            record_session.close()
+            if record_session.event_count > 0:
+                print(f"Recording saved to: {record_session.log_path}")
+
+    return 0
+
+
+def run_record_batch(args: argparse.Namespace) -> int:
+    pythonpath = args.pythonpath if args.pythonpath is not None else os.environ.get("PYTHONPATH", "")
+    state = detect_state(args)
+    refresh = max(1, args.refresh)
+    record_path = args.out or default_session_path()
+    record_session = RecordSession(record_path, state, refresh, pythonpath)
+    quiet = bool(args.quiet)
+    install_attempted: set = set()
+    start_time = time.time()
+    last_change: Optional[float] = None
+    last_heartbeat = start_time
+    last_divergence_time = 0.0
+    stop_reason = "completed"
+
+    target = state.selector.display or "python"
+    target = shorten(target, 120)
+    print(
+        f"recording start | path={record_session.log_path} | ranks={len(state.ranks)} | "
+        f"refresh={refresh}s | target={target}"
+    )
+
+    try:
+        while True:
+            loop_start = time.time()
+            if not is_pid_alive(state.prte_pid):
+                stop_reason = "prterun-exited"
+                break
+            rank_to_proc, _pid_errors = collect_rank_pids(state)
+            snapshots, _stack_errors = collect_stacks(
+                state, rank_to_proc, pythonpath, False, install_attempted
+            )
+            if record_session.record_if_changed(state, rank_to_proc, snapshots):
+                last_change = time.time()
+            divergence, common_len, max_len = compute_divergence_from_snapshots(state.ranks, snapshots)
+            now = time.time()
+            if not quiet and now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                last_change_age = "never"
+                if last_change is not None:
+                    last_change_age = format_duration(int(now - last_change))
+                elapsed = format_duration(int(now - start_time))
+                print(
+                    f"heartbeat | events={record_session.event_count} | "
+                    f"last_change={last_change_age} | elapsed={elapsed}"
+                )
+                last_heartbeat = now
+            if (
+                not quiet
+                and divergence >= DIVERGENCE_THRESHOLD
+                and now - last_divergence_time >= DIVERGENCE_INTERVAL
+            ):
+                print(
+                    f"divergence | ratio={divergence:.2f} | common={common_len} | max={max_len}"
+                )
+                last_divergence_time = now
+            elapsed = time.time() - loop_start
+            sleep_for = refresh - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        stop_reason = "interrupted"
+    finally:
+        record_session.close()
+        elapsed = format_duration(int(time.time() - start_time))
+        print(
+            f"recording stop | reason={stop_reason} | events={record_session.event_count} | "
+            f"elapsed={elapsed} | path={record_session.log_path}"
+        )
+
+    return 0
+
+
+def run_review(args: argparse.Namespace) -> int:
+    metadata = load_session_metadata(args.path)
+    ranks = [
+        RankInfo(rank=int(item["rank"]), host=str(item["host"]))
+        for item in metadata.get("ranks", [])
+        if "rank" in item and "host" in item
+    ]
+    if not ranks:
+        raise SystemExit("no ranks found in metadata")
+    selector_payload = metadata.get("selector", {}) if isinstance(metadata.get("selector"), dict) else {}
+    selector = ProgramSelector(
+        module=selector_payload.get("module"),
+        script=selector_payload.get("script"),
+        display=selector_payload.get("display", ""),
+    )
+    state = State(
+        prte_pid=int(metadata.get("prte_pid", 0) or 0),
+        rankfile=str(metadata.get("rankfile", "")),
+        ranks=ranks,
+        selector=selector,
+    )
+    events = load_session_events(args.path)
+    if not events:
+        raise SystemExit("no events recorded")
+
+    console = Console()
+    show_threads = False
+    show_details = False
+    levels = [TimelineLevel(0, len(events), selected=0)]
+    max_stack_lens, divergence_ratios, _ = compute_event_metrics(
+        events, ranks, show_threads
+    )
+
+    def handle_sigint(_sig, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+
+    layout = Layout()
+    layout.split_column(Layout(name="header", size=HEADER_HEIGHT), Layout(name="body"))
+
+    def refresh_view() -> None:
+        width, height = shutil.get_terminal_size((120, 40))
+        content_width = max(0, width - 4)
+        timeline_lines = render_timeline_lines(levels, max_stack_lens, divergence_ratios, content_width)
+        active_level = levels[-1]
+        if not active_level.buckets:
+            return
+        current_index = active_level.buckets[active_level.selected][0]
+        current_index = max(0, min(current_index, len(events) - 1))
+        event = events[current_index]
+        snapshots = event_snapshots_from_event(event, ranks, show_threads)
+        rank_to_proc = rank_to_proc_from_event(event, ranks)
+        stack_lines_by_rank = {
+            rank: extract_stack_lines(snapshot.stack_lines)
+            for rank, snapshot in snapshots.items()
+        }
+        prefix_len = common_prefix_length(stack_lines_by_rank)
+        diff_index = None
+        if any(stack_lines_by_rank.values()):
+            diff_index = max(0, prefix_len - 1) if prefix_len > 0 else 0
+        stacks_text: Dict[int, Text] = {}
+        for rank, snapshot in snapshots.items():
+            lines = snapshot.stack_lines
+            marked = mark_diff_line(lines, diff_index) if diff_index is not None else lines
+            stacks_text[rank] = style_lines(marked)
+        details_by_rank = {
+            rank: snapshot.details for rank, snapshot in snapshots.items()
+        }
+        event_time = iso_timestamp(event.timestamp)
+        header, header_lines = build_review_header(
+            state,
+            current_index,
+            len(events),
+            event_time,
+            timeline_lines,
+            content_width,
+        )
+        header_height = header_lines + 2
+        header_height = max(3, min(header_height, max(3, height - 1)))
+        layout["header"].size = header_height
+        body_height = max(1, height - header_height)
+        total_columns = len(ranks) + (1 if show_details else 0)
+        column_width = max(1, content_width // max(1, total_columns))
+        inner_width = max(1, column_width - 4)
+        details_text = (
+            build_details_text(ranks, rank_to_proc, details_by_rank, inner_width)
+            if show_details
+            else None
+        )
+        layout["header"].update(
+            Panel(header, padding=(0, 1), border_style=BORDER_STYLE)
+        )
+        layout["body"].update(
+            render_columns(ranks, stacks_text, details_text, body_height, rank_to_proc)
+        )
+
+    try:
+        refresh_view()
+        with Live(layout, console=console, refresh_per_second=10, screen=True):
+            while True:
+                key = read_key(0.1)
+                if key is None:
+                    continue
+                if key == "q":
+                    return 0
+                if key == "t":
+                    show_threads = not show_threads
+                    max_stack_lens, divergence_ratios, _ = compute_event_metrics(
+                        events, ranks, show_threads
+                    )
+                    refresh_view()
+                if key == "d":
+                    show_details = not show_details
+                    refresh_view()
+                if key == "left":
+                    level = levels[-1]
+                    level.selected = max(0, level.selected - 1)
+                    refresh_view()
+                if key == "right":
+                    level = levels[-1]
+                    level.selected = min(max(0, len(level.buckets) - 1), level.selected + 1)
+                    refresh_view()
+                if key == "down":
+                    level = levels[-1]
+                    if not level.buckets:
+                        continue
+                    bucket = level.buckets[level.selected]
+                    if bucket[1] - bucket[0] <= 1:
+                        continue
+                    levels.append(TimelineLevel(bucket[0], bucket[1], selected=0))
+                    refresh_view()
+                if key == "up":
+                    if len(levels) > 1:
+                        levels.pop()
+                        refresh_view()
     except KeyboardInterrupt:
         return 0
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     return 0
+
+
+def run_summarize(args: argparse.Namespace) -> int:
+    metadata = load_session_metadata(args.path)
+    events = load_session_events(args.path)
+    ranks = [
+        RankInfo(rank=int(item["rank"]), host=str(item["host"]))
+        for item in metadata.get("ranks", [])
+        if "rank" in item and "host" in item
+    ]
+    if not ranks:
+        raise SystemExit("no ranks found in metadata")
+    if not events:
+        raise SystemExit("no events recorded")
+
+    rank_order = [info.rank for info in ranks]
+    signature_counts: Dict[Tuple[str, ...], int] = {}
+    signature_examples: Dict[Tuple[str, ...], Dict[int, str]] = {}
+    rank_change_counts: Dict[int, int] = {rank: 0 for rank in rank_order}
+    previous_rank_signature: Dict[int, str] = {rank: "" for rank in rank_order}
+    max_stack_lens, divergence_ratios, common_prefixes = compute_event_metrics(
+        events, ranks, show_threads=False
+    )
+
+    for event in events:
+        per_rank_signature: Dict[int, str] = {}
+        per_rank_top_frame: Dict[int, str] = {}
+        for info in ranks:
+            payload = event.ranks.get(info.rank, {})
+            if payload.get("error"):
+                signature = f"error:{payload.get('error')}"
+                top_frame = signature
+            else:
+                output = payload.get("py_spy")
+                if output:
+                    lines, _details = render_pyspy_output(str(output), show_threads=False)
+                    stack_lines = extract_stack_lines(lines)
+                    signature = hashlib.sha1(
+                        "\n".join(stack_lines).encode("utf-8", errors="ignore")
+                    ).hexdigest()
+                    top_frame = stack_lines[0].strip() if stack_lines else "empty"
+                else:
+                    signature = "empty"
+                    top_frame = "empty"
+            per_rank_signature[info.rank] = signature
+            per_rank_top_frame[info.rank] = top_frame
+
+        for rank, signature in per_rank_signature.items():
+            if previous_rank_signature.get(rank) != signature:
+                rank_change_counts[rank] = rank_change_counts.get(rank, 0) + 1
+            previous_rank_signature[rank] = signature
+
+        signature_key = tuple(per_rank_signature[rank] for rank in rank_order)
+        signature_counts[signature_key] = signature_counts.get(signature_key, 0) + 1
+        if signature_key not in signature_examples:
+            signature_examples[signature_key] = per_rank_top_frame
+
+    sorted_signatures = sorted(
+        signature_counts.items(), key=lambda item: item[1], reverse=True
+    )
+    top_signatures = sorted_signatures[: max(1, args.top)]
+    total_events = len(events)
+    start_time = iso_timestamp(events[0].timestamp)
+    end_time = iso_timestamp(events[-1].timestamp)
+
+    if args.format == "json":
+        payload = {
+            "metadata": metadata,
+            "event_count": total_events,
+            "time_range": {"start": start_time, "end": end_time},
+            "rank_change_counts": rank_change_counts,
+            "top_signatures": [
+                {
+                    "count": count,
+                    "ratio": count / float(total_events),
+                    "example_top_frames": signature_examples.get(signature_key, {}),
+                }
+                for signature_key, count in top_signatures
+            ],
+            "most_divergent": sorted(
+                [
+                    {
+                        "index": idx,
+                        "timestamp": iso_timestamp(events[idx].timestamp),
+                        "divergence_ratio": divergence_ratios[idx],
+                        "common_prefix_len": common_prefixes[idx],
+                        "max_stack_len": max_stack_lens[idx],
+                    }
+                    for idx in range(total_events)
+                ],
+                key=lambda item: item["divergence_ratio"],
+                reverse=True,
+            )[:5],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    print(f"Session: {args.path}")
+    print(f"Events: {total_events} ({start_time} -> {end_time})")
+    print(f"Ranks: {', '.join(str(rank) for rank in rank_order)}")
+    print("")
+    print("Top stack signatures:")
+    for idx, (signature_key, count) in enumerate(top_signatures, start=1):
+        ratio = count / float(total_events)
+        print(f"{idx}. {count} events ({ratio:.1%})")
+        example = signature_examples.get(signature_key, {})
+        for rank in rank_order:
+            frame = example.get(rank, "")
+            frame = shorten(frame, 120)
+            print(f"   rank {rank}: {frame}")
+    print("")
+    print("Rank change counts:")
+    for rank in rank_order:
+        print(f"  rank {rank}: {rank_change_counts.get(rank, 0)}")
+    print("")
+    print("Most divergent events:")
+    divergent = sorted(
+        range(total_events),
+        key=lambda idx: divergence_ratios[idx],
+        reverse=True,
+    )[:5]
+    for idx in divergent:
+        print(
+            f"  #{idx + 1} @ {iso_timestamp(events[idx].timestamp)} | "
+            f"ratio {divergence_ratios[idx]:.2f} | "
+            f"common {common_prefixes[idx]} | "
+            f"max {max_stack_lens[idx]}"
+        )
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    if argv and argv[0] in {"review", "summarize", "record"}:
+        command = argv[0]
+        sub_args = argv[1:]
+        if command == "review":
+            return run_review(parse_review_args(sub_args))
+        if command == "record":
+            return run_record_batch(parse_record_args(sub_args))
+        return run_summarize(parse_summarize_args(sub_args))
+    return run_live(parse_live_args(argv))
 
 
 def select_with_timeout(timeout: float):
