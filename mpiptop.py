@@ -53,7 +53,9 @@ class ProgramSelector:
 
 @dataclasses.dataclass(frozen=True)
 class State:
+    launcher: str
     prte_pid: int
+    slurm_job_id: Optional[str]
     rankfile: str
     ranks: List[RankInfo]
     selector: ProgramSelector
@@ -132,6 +134,7 @@ import os
 
 TARGET = os.environ.get("MPIPTOP_TARGET", "")
 MODULE = os.environ.get("MPIPTOP_MODULE", "")
+JOB_ID = os.environ.get("MPIPTOP_SLURM_JOB_ID", "")
 ENV_KEYS = [
     "PATH",
     "LD_LIBRARY_PATH",
@@ -205,6 +208,12 @@ def matches(cmd):
     return True
 
 
+def matches_job(env):
+    if not JOB_ID:
+        return True
+    return env.get("SLURM_JOB_ID") == JOB_ID
+
+
 results = []
 for pid in os.listdir("/proc"):
     if not pid.isdigit():
@@ -214,7 +223,14 @@ for pid in os.listdir("/proc"):
         if not matches(cmd):
             continue
         env = read_env(pid)
-        rank = env.get("OMPI_COMM_WORLD_RANK") or env.get("PMIX_RANK") or env.get("PMI_RANK")
+        if not matches_job(env):
+            continue
+        rank = (
+            env.get("OMPI_COMM_WORLD_RANK")
+            or env.get("PMIX_RANK")
+            or env.get("PMI_RANK")
+            or env.get("SLURM_PROCID")
+        )
         if rank is None:
             continue
         results.append(
@@ -278,6 +294,8 @@ def write_session_metadata(log_path: str, state: State, refresh: int, pythonpath
         "refresh": refresh,
         "rankfile": state.rankfile,
         "prte_pid": state.prte_pid,
+        "launcher": state.launcher,
+        "slurm_job_id": state.slurm_job_id,
         "selector": dataclasses.asdict(state.selector),
         "ranks": [dataclasses.asdict(rank) for rank in state.ranks],
         "pythonpath": pythonpath,
@@ -699,6 +717,7 @@ def matches_python_cmd(cmd: List[str], selector: ProgramSelector) -> bool:
 
 def find_rank_pids_local(
     selector: ProgramSelector,
+    slurm_job_id: Optional[str],
 ) -> List[Tuple[int, int, str, Optional[int], Optional[str], Dict[str, str]]]:
     results: List[Tuple[int, int, str, Optional[int], Optional[str], Dict[str, str]]] = []
     for pid in os.listdir("/proc"):
@@ -717,7 +736,14 @@ def find_rank_pids_local(
                     continue
                 key, value = item.split(b"=", 1)
                 env[key.decode(errors="ignore")] = value.decode(errors="ignore")
-            rank = env.get("OMPI_COMM_WORLD_RANK") or env.get("PMIX_RANK") or env.get("PMI_RANK")
+            if slurm_job_id and env.get("SLURM_JOB_ID") != slurm_job_id:
+                continue
+            rank = (
+                env.get("OMPI_COMM_WORLD_RANK")
+                or env.get("PMIX_RANK")
+                or env.get("PMI_RANK")
+                or env.get("SLURM_PROCID")
+            )
             if rank is None:
                 continue
             rss_kb = read_rss_kb(int(pid))
@@ -765,12 +791,15 @@ def run_ssh(host: str, command: str, timeout: int = 8) -> subprocess.CompletedPr
 
 
 def find_rank_pids_remote(
-    host: str, selector: ProgramSelector
+    host: str,
+    selector: ProgramSelector,
+    slurm_job_id: Optional[str],
 ) -> Tuple[List[Tuple[int, int, str, Optional[int], Optional[str], Dict[str, str]]], Optional[str]]:
     env_prefix = build_env_prefix(
         {
             "MPIPTOP_TARGET": selector.script or "",
             "MPIPTOP_MODULE": selector.module or "",
+            "MPIPTOP_SLURM_JOB_ID": slurm_job_id or "",
         }
     )
     remote_cmd = f"{env_prefix}python3 - <<'PY'\n{REMOTE_FINDER_SCRIPT}\nPY"
@@ -1963,18 +1992,204 @@ def is_pid_alive(pid: int) -> bool:
         return True
     return True
 
+
+def parse_scontrol_kv(line: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for token in line.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        fields[key] = value
+    return fields
+
+
+def run_scontrol_show_job(job_id: str) -> Dict[str, str]:
+    result = subprocess.run(
+        ["scontrol", "show", "job", "-o", str(job_id)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise SystemExit(f"scontrol show job failed for {job_id}: {stderr or 'unknown error'}")
+    line = (result.stdout or "").strip()
+    if not line:
+        raise SystemExit(f"scontrol show job returned empty output for {job_id}")
+    return parse_scontrol_kv(line)
+
+
+def expand_slurm_nodelist(nodelist: str) -> List[str]:
+    result = subprocess.run(
+        ["scontrol", "show", "hostnames", nodelist],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise SystemExit(f"scontrol show hostnames failed: {stderr or 'unknown error'}")
+    hosts = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not hosts:
+        raise SystemExit(f"no hosts parsed from nodelist: {nodelist}")
+    return hosts
+
+
+def parse_tasks_per_node(raw: str) -> List[int]:
+    if not raw:
+        return []
+    counts: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        match = re.match(r"(\d+)\(x(\d+)\)", part)
+        if match:
+            value = int(match.group(1))
+            repeat = int(match.group(2))
+            counts.extend([value] * repeat)
+            continue
+        if part.isdigit():
+            counts.append(int(part))
+    return counts
+
+
+def distribute_tasks(num_tasks: int, num_nodes: int) -> List[int]:
+    if num_nodes <= 0:
+        return []
+    base = num_tasks // num_nodes
+    remainder = num_tasks % num_nodes
+    counts = [base] * num_nodes
+    for idx in range(remainder):
+        counts[idx] += 1
+    return counts
+
+
+def slurm_job_to_ranks(job_id: str) -> List[RankInfo]:
+    info = run_scontrol_show_job(job_id)
+    nodelist = info.get("NodeList") or info.get("Nodes")
+    if not nodelist:
+        raise SystemExit(f"no NodeList found for slurm job {job_id}")
+    hosts = expand_slurm_nodelist(nodelist)
+    tasks_per_node = parse_tasks_per_node(info.get("TasksPerNode", ""))
+    num_tasks = 0
+    try:
+        num_tasks = int(info.get("NumTasks", "0") or 0)
+    except ValueError:
+        num_tasks = 0
+
+    if len(tasks_per_node) != len(hosts):
+        if num_tasks > 0:
+            tasks_per_node = distribute_tasks(num_tasks, len(hosts))
+        else:
+            tasks_per_node = [1] * len(hosts)
+
+    ranks: List[RankInfo] = []
+    rank_id = 0
+    for host, count in zip(hosts, tasks_per_node):
+        for _ in range(max(0, count)):
+            ranks.append(RankInfo(rank=rank_id, host=host))
+            rank_id += 1
+    return ranks
+
+
+def resolve_slurm_job_id(args: argparse.Namespace) -> Optional[str]:
+    if getattr(args, "slurm_job", None):
+        return str(args.slurm_job)
+    env_job = os.environ.get("SLURM_JOB_ID")
+    if env_job:
+        return env_job
+    user = os.environ.get("USER")
+    if not user:
+        return None
+    result = subprocess.run(
+        ["squeue", "-u", user, "-h", "-t", "R", "-o", "%i"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    jobs = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(jobs) == 1:
+        return jobs[0]
+    return None
+
+
+def describe_slurm_jobs() -> str:
+    user = os.environ.get("USER")
+    if not user:
+        return ""
+    result = subprocess.run(
+        ["squeue", "-u", user, "-h", "-o", "%i %t %j %R"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines[:10])
+
+
+def is_slurm_job_alive(job_id: Optional[str]) -> bool:
+    if not job_id:
+        return False
+    result = subprocess.run(
+        ["squeue", "-j", str(job_id), "-h", "-o", "%t"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    state = (result.stdout or "").strip()
+    return bool(state)
+
 def detect_state(args: argparse.Namespace) -> State:
     procs = read_ps()
-    prte = find_prterun(procs, args.prterun_pid)
-    rankfile = args.rankfile or find_rankfile_path(prte.args)
-    if not rankfile:
-        raise SystemExit("rankfile not found in prterun/mpirun args")
-    ranks = parse_rankfile(rankfile)
-    children = build_children_map(procs)
-    descendants = find_descendants(children, prte.pid)
-    program_proc = select_program(procs, descendants)
-    selector = parse_python_selector(program_proc.args if program_proc else "")
-    return State(prte_pid=prte.pid, rankfile=rankfile, ranks=ranks, selector=selector)
+    prte_error = None
+    prte = None
+    try:
+        prte = find_prterun(procs, args.prterun_pid)
+    except SystemExit as exc:
+        prte_error = str(exc)
+
+    if prte is not None:
+        rankfile = args.rankfile or find_rankfile_path(prte.args)
+        if not rankfile:
+            raise SystemExit("rankfile not found in prterun/mpirun args")
+        ranks = parse_rankfile(rankfile)
+        children = build_children_map(procs)
+        descendants = find_descendants(children, prte.pid)
+        program_proc = select_program(procs, descendants)
+        selector = parse_python_selector(program_proc.args if program_proc else "")
+        return State(
+            launcher="prte",
+            prte_pid=prte.pid,
+            slurm_job_id=None,
+            rankfile=rankfile,
+            ranks=ranks,
+            selector=selector,
+        )
+
+    slurm_job_id = resolve_slurm_job_id(args)
+    if slurm_job_id:
+        ranks = slurm_job_to_ranks(slurm_job_id)
+        selector = ProgramSelector(module=None, script=None, display="")
+        return State(
+            launcher="slurm",
+            prte_pid=0,
+            slurm_job_id=slurm_job_id,
+            rankfile=f"slurm:{slurm_job_id}",
+            ranks=ranks,
+            selector=selector,
+        )
+
+    hint = describe_slurm_jobs()
+    if hint:
+        hint = "\n" + hint
+    raise SystemExit(
+        prte_error
+        or f"no prterun/mpirun process found and no slurm job detected (try --slurm-job){hint}"
+    )
 
 
 def collect_rank_pids(state: State) -> Tuple[Dict[int, RankProcess], List[str]]:
@@ -1985,10 +2200,10 @@ def collect_rank_pids(state: State) -> Tuple[Dict[int, RankProcess], List[str]]:
 
     for host in hosts:
         if is_local_host(host):
-            entries = find_rank_pids_local(state.selector)
+            entries = find_rank_pids_local(state.selector, state.slurm_job_id)
             host_error = None
         else:
-            entries, host_error = find_rank_pids_remote(host, state.selector)
+            entries, host_error = find_rank_pids_remote(host, state.selector, state.slurm_job_id)
         if host_error:
             errors.append(host_error)
         for rank, pid, cmd, rss_kb, python_exe, env_subset in entries:
@@ -2051,6 +2266,7 @@ def parse_live_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Show MPI Python stacks across hosts.")
     parser.add_argument("--rankfile", help="Override rankfile path")
     parser.add_argument("--prterun-pid", type=int, help="PID of prterun/mpirun")
+    parser.add_argument("--slurm-job", help="Slurm job ID to inspect")
     parser.add_argument("--refresh", type=int, default=10, help="Refresh interval (seconds)")
     parser.add_argument(
         "--pythonpath",
@@ -2091,6 +2307,7 @@ def parse_record_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
     parser = argparse.ArgumentParser(description="Record an mpiptop session.")
     parser.add_argument("--rankfile", help="Override rankfile path")
     parser.add_argument("--prterun-pid", type=int, help="PID of prterun/mpirun")
+    parser.add_argument("--slurm-job", help="Slurm job ID to inspect")
     parser.add_argument("--refresh", type=int, default=10, help="Refresh interval (seconds)")
     parser.add_argument(
         "--pythonpath",
@@ -2277,9 +2494,14 @@ def run_record_batch(args: argparse.Namespace) -> int:
     try:
         while True:
             loop_start = time.time()
-            if not is_pid_alive(state.prte_pid):
-                stop_reason = "prterun-exited"
-                break
+            if state.launcher == "prte":
+                if not is_pid_alive(state.prte_pid):
+                    stop_reason = "prterun-exited"
+                    break
+            else:
+                if not is_slurm_job_alive(state.slurm_job_id):
+                    stop_reason = "slurm-job-exited"
+                    break
             rank_to_proc, _pid_errors = collect_rank_pids(state)
             snapshots, _stack_errors = collect_stacks(
                 state, rank_to_proc, pythonpath, False, install_attempted
@@ -2340,7 +2562,9 @@ def run_review(args: argparse.Namespace) -> int:
         display=selector_payload.get("display", ""),
     )
     state = State(
+        launcher=str(metadata.get("launcher", "prte")),
         prte_pid=int(metadata.get("prte_pid", 0) or 0),
+        slurm_job_id=metadata.get("slurm_job_id"),
         rankfile=str(metadata.get("rankfile", "")),
         ranks=ranks,
         selector=selector,

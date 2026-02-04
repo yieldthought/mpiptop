@@ -28,10 +28,13 @@ Common options:
 ```bash
 mpiptop --rankfile /etc/mpirun/rankfile_01_02
 mpiptop --prterun-pid 12345
+mpiptop --slurm-job 123456
 mpiptop --refresh 5
 mpiptop --pythonpath /path/to/your/code
 mpiptop record --out ./mpiptop-session-20260123-120000.jsonl
 ```
+
+Slurm notes: if `SLURM_JOB_ID` is set or you have exactly one running job, mpiptop will auto-detect it.
 
 Record/review (record is batch mode; use plain `mpiptop` for the TUI):
 ```bash
