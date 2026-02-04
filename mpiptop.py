@@ -1580,16 +1580,16 @@ def build_live_header(
         record_text.no_wrap = True
         record_text.overflow = "crop"
 
-    controls_plain = "q quit | space refresh | t threads | d details | r record"
-    padding = max(0, width - len(controls_plain))
-    controls_line = Text(" " * padding + controls_plain)
-    for token in ["q", "space", "t", "d", "r"]:
-        start = controls_plain.find(token)
-        if start != -1:
-            controls_line.stylize(KEY_STYLE, padding + start, padding + start + len(token))
-    controls_line.truncate(width)
-    controls_line.no_wrap = True
-    controls_line.overflow = "crop"
+    controls_line = build_controls_line(
+        [
+            ("q", "quit"),
+            ("space", "refresh"),
+            ("t", "threads"),
+            ("d", "details"),
+            ("r", "record"),
+        ],
+        width,
+    )
 
     text = Text()
     for idx, line in enumerate(program_lines):
@@ -1613,6 +1613,7 @@ def build_review_header(
     event_total: int,
     event_time: str,
     timeline_lines: List[Text],
+    timeline_marker: Optional[Text],
     width: int,
 ) -> Tuple[Text, int]:
     program_lines = wrap_program_lines(state.selector, width)
@@ -1623,16 +1624,17 @@ def build_review_header(
     )
     status_line.truncate(width)
 
-    controls_plain = "q quit | left/right move | down zoom | up zoom out | t threads | d details"
-    padding = max(0, width - len(controls_plain))
-    controls_line = Text(" " * padding + controls_plain)
-    for token in ["q", "left/right", "down", "up", "t", "d"]:
-        start = controls_plain.find(token)
-        if start != -1:
-            controls_line.stylize(KEY_STYLE, padding + start, padding + start + len(token))
-    controls_line.truncate(width)
-    controls_line.no_wrap = True
-    controls_line.overflow = "crop"
+    controls_line = build_controls_line(
+        [
+            ("q", "quit"),
+            ("left/right", "move"),
+            ("down", "zoom"),
+            ("up", "zoom out"),
+            ("t", "threads"),
+            ("d", "details"),
+        ],
+        width,
+    )
 
     text = Text()
     for idx, line in enumerate(program_lines):
@@ -1644,11 +1646,15 @@ def build_review_header(
     for line in timeline_lines:
         text.append("\n")
         text.append_text(line)
+    if timeline_marker is not None:
+        text.append("\n")
+        text.append_text(timeline_marker)
     text.append("\n")
     text.append_text(controls_line)
     text.no_wrap = True
     text.overflow = "crop"
-    return text, len(program_lines) + 1 + len(timeline_lines) + 1
+    extra_lines = 1 + len(timeline_lines) + (1 if timeline_marker is not None else 0) + 1
+    return text, len(program_lines) + extra_lines
 
 
 def build_buckets(start: int, end: int, width: int) -> List[Tuple[int, int]]:
@@ -1749,6 +1755,42 @@ def render_timeline_lines(
     return lines
 
 
+def build_controls_line(controls: List[Tuple[str, str]], width: int) -> Text:
+    parts: List[Tuple[str, Optional[str]]] = []
+    for idx, (key, desc) in enumerate(controls):
+        if idx:
+            parts.append((" | ", None))
+        parts.append((key, KEY_STYLE))
+        if desc:
+            parts.append((f" {desc}", None))
+    plain = "".join(part for part, _style in parts)
+    padding = max(0, width - len(plain))
+    text = Text(" " * padding)
+    for part, style in parts:
+        if style:
+            text.append(part, style=style)
+        else:
+            text.append(part)
+    text.truncate(width)
+    text.no_wrap = True
+    text.overflow = "crop"
+    return text
+
+
+def build_timeline_marker(levels: List[TimelineLevel], width: int) -> Optional[Text]:
+    if not levels:
+        return None
+    active = levels[-1]
+    if not active.buckets:
+        return None
+    selected = max(0, min(active.selected, len(active.buckets) - 1))
+    marker = Text(" " * selected + "^", style=f"{KEY_STYLE} bold")
+    marker.truncate(width)
+    marker.no_wrap = True
+    marker.overflow = "crop"
+    return marker
+
+
 def event_snapshots_from_event(
     event: SessionEvent,
     ranks: List[RankInfo],
@@ -1841,24 +1883,73 @@ def compute_divergence_from_snapshots(
 
 
 def read_key(timeout: float) -> Optional[str]:
-    if sys.stdin not in select_with_timeout(timeout):
+    fd = sys.stdin.fileno()
+    if fd not in select_with_timeout(timeout, fd):
         return None
-    key = sys.stdin.read(1)
-    if key != "\x1b":
-        return key
-    seq = key
-    for _ in range(2):
-        if sys.stdin in select_with_timeout(0.01):
-            seq += sys.stdin.read(1)
-    if seq == "\x1b[A":
+    try:
+        key = os.read(fd, 1)
+    except OSError:
+        return None
+    if not key:
+        return None
+    if key != b"\x1b":
+        return key.decode(errors="ignore")
+    seq = _read_escape_sequence(fd)
+    full = b"\x1b" + seq
+    if full == b"\x1b[A" or full == b"\x1bOA":
         return "up"
-    if seq == "\x1b[B":
+    if full == b"\x1b[B" or full == b"\x1bOB":
         return "down"
-    if seq == "\x1b[C":
+    if full == b"\x1b[C" or full == b"\x1bOC":
         return "right"
-    if seq == "\x1b[D":
+    if full == b"\x1b[D" or full == b"\x1bOD":
         return "left"
+    if full.startswith(b"\x1b[") or full.startswith(b"\x1bO"):
+        last = full[-1:]
+        if last == b"A":
+            return "up"
+        if last == b"B":
+            return "down"
+        if last == b"C":
+            return "right"
+        if last == b"D":
+            return "left"
     return None
+
+
+def _read_escape_sequence(fd: int) -> bytes:
+    if fd not in select_with_timeout(0.05, fd):
+        return b""
+    try:
+        first = os.read(fd, 1)
+    except OSError:
+        return b""
+    if not first:
+        return b""
+    if first == b"O":
+        if fd in select_with_timeout(0.05, fd):
+            try:
+                second = os.read(fd, 1)
+            except OSError:
+                return b"O"
+            return b"O" + (second or b"")
+        return b"O"
+    if first == b"[":
+        seq = b"["
+        for _ in range(12):
+            if fd not in select_with_timeout(0.05, fd):
+                break
+            try:
+                ch = os.read(fd, 1)
+            except OSError:
+                break
+            if not ch:
+                break
+            seq += ch
+            if 0x40 <= ch[0] <= 0x7E:
+                break
+        return seq
+    return first
 
 
 def is_pid_alive(pid: int) -> bool:
@@ -2282,6 +2373,7 @@ def run_review(args: argparse.Namespace) -> int:
         width, height = shutil.get_terminal_size((120, 40))
         content_width = max(0, width - 4)
         timeline_lines = render_timeline_lines(levels, max_stack_lens, divergence_ratios, content_width)
+        timeline_marker = build_timeline_marker(levels, content_width)
         active_level = levels[-1]
         if not active_level.buckets:
             return
@@ -2313,6 +2405,7 @@ def run_review(args: argparse.Namespace) -> int:
             len(events),
             event_time,
             timeline_lines,
+            timeline_marker,
             content_width,
         )
         header_height = header_lines + 2
@@ -2523,11 +2616,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return run_live(parse_live_args(argv))
 
 
-def select_with_timeout(timeout: float):
+def select_with_timeout(timeout: float, fd: Optional[int] = None):
     import select
 
+    target = fd if fd is not None else sys.stdin
     try:
-        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+        readable, _, _ = select.select([target], [], [], timeout)
     except ValueError:
         return []
     return readable
