@@ -785,6 +785,7 @@ def run_ssh(host: str, command: str, timeout: int = 8) -> subprocess.CompletedPr
             command,
         ],
         capture_output=True,
+        stdin=subprocess.DEVNULL,
         text=True,
         timeout=timeout,
     )
@@ -866,6 +867,7 @@ def run_py_spy(
             return subprocess.run(
                 cmd,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
                 timeout=timeout,
                 env=env,
@@ -900,6 +902,7 @@ def run_py_spy(
                 result = subprocess.run(
                     [python_exe, "-m", "pip", "install", "py-spy"],
                     capture_output=True,
+                    stdin=subprocess.DEVNULL,
                     text=True,
                     timeout=120,
                     env=env,
@@ -911,6 +914,7 @@ def run_py_spy(
             retry = subprocess.run(
                 [python_exe, "-m", "pip", "install", "--user", "py-spy"],
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
                 timeout=120,
                 env=env,
@@ -1053,6 +1057,7 @@ def uv_install_local(python_exe: str, env: Dict[str, str], pip_error: str) -> Op
         result = subprocess.run(
             [uv_path, "pip", "install", "--python", python_exe, "py-spy"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=120,
             env=env,
@@ -1102,6 +1107,7 @@ def pip_user_install_local(env: Dict[str, str]) -> Optional[str]:
         result = subprocess.run(
             ["pip", "install", "--user", "py-spy"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=120,
             env=env,
@@ -2429,35 +2435,55 @@ def run_live(args: argparse.Namespace) -> int:
             render_columns(state.ranks, stacks_text, details_text, body_height, rank_to_proc)
         )
 
+    def handle_keypress(key: str) -> Optional[int]:
+        nonlocal next_refresh, show_threads, show_details, recording_enabled
+        if key == "q":
+            return 0
+        if key == " ":
+            next_refresh = 0.0
+            return None
+        if key == "t":
+            show_threads = not show_threads
+            next_refresh = 0.0
+            return None
+        if key == "d":
+            show_details = not show_details
+            next_refresh = 0.0
+            return None
+        if key == "r":
+            if recording_enabled:
+                stop_recording()
+            else:
+                start_recording()
+            next_refresh = 0.0
+            return None
+        return None
+
     try:
         refresh_view()
         next_refresh = time.time() + refresh
         with Live(layout, console=console, refresh_per_second=10, screen=True):
             while True:
                 now = time.time()
+                key = read_key(0.0)
+                if key is not None:
+                    result = handle_keypress(key)
+                    if result is not None:
+                        return result
+                    continue
+
                 if now >= next_refresh:
                     refresh_view()
-                    next_refresh = now + refresh
+                    next_refresh = time.time() + refresh
+                    continue
 
-                key = read_key(0.1)
+                wait = min(0.1, max(0.0, next_refresh - now))
+                key = read_key(wait)
                 if key is None:
                     continue
-                if key == "q":
-                    return 0
-                if key == " ":
-                    next_refresh = 0.0
-                if key == "t":
-                    show_threads = not show_threads
-                    next_refresh = 0.0
-                if key == "d":
-                    show_details = not show_details
-                    next_refresh = 0.0
-                if key == "r":
-                    if recording_enabled:
-                        stop_recording()
-                    else:
-                        start_recording()
-                    next_refresh = 0.0
+                result = handle_keypress(key)
+                if result is not None:
+                    return result
     except KeyboardInterrupt:
         return 0
     finally:
