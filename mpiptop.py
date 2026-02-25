@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import termios
 import time
 import textwrap
@@ -88,6 +89,14 @@ class RankSnapshot:
     error: Optional[str]
     stack_lines: List[str]
     details: List[str]
+
+
+@dataclasses.dataclass
+class LiveData:
+    rank_to_proc: Dict[int, RankProcess] = dataclasses.field(default_factory=dict)
+    snapshots: Dict[int, RankSnapshot] = dataclasses.field(default_factory=dict)
+    last_update: str = "never"
+    version: int = 0
 
 
 @dataclasses.dataclass
@@ -2346,6 +2355,13 @@ def run_live(args: argparse.Namespace) -> int:
     recording_enabled = bool(getattr(args, "record", False))
     record_started_at: Optional[float] = None
     record_path = args.out
+    data_lock = threading.Lock()
+    state_lock = threading.Lock()
+    control_lock = threading.Lock()
+    latest_data = LiveData()
+    refresh_event = threading.Event()
+    stop_event = threading.Event()
+    collector_thread: Optional[threading.Thread] = None
 
     def handle_sigint(_sig, _frame):
         raise KeyboardInterrupt
@@ -2360,71 +2376,128 @@ def run_live(args: argparse.Namespace) -> int:
     layout.split_column(Layout(name="header", size=HEADER_HEIGHT), Layout(name="body"))
 
     last_update = "never"
-    next_refresh = 0.0
+    render_interval = 0.2
+    next_render = 0.0
+    seen_version = -1
 
     def start_recording() -> None:
         nonlocal record_session, recording_enabled, record_started_at, record_path
-        if record_session is None:
-            record_path = record_path or default_session_path()
-            record_session = RecordSession(record_path, state, refresh, pythonpath)
-        recording_enabled = True
-        if record_started_at is None:
-            record_started_at = time.time()
+        with control_lock:
+            if record_session is None:
+                record_path = record_path or default_session_path()
+                with state_lock:
+                    current_state = state
+                record_session = RecordSession(record_path, current_state, refresh, pythonpath)
+            recording_enabled = True
+            if record_started_at is None:
+                record_started_at = time.time()
 
     def stop_recording() -> None:
         nonlocal recording_enabled, record_started_at
-        recording_enabled = False
-        record_started_at = None
+        with control_lock:
+            recording_enabled = False
+            record_started_at = None
 
     if recording_enabled:
         start_recording()
 
+    def collect_loop() -> None:
+        nonlocal state
+        next_refresh = 0.0
+        while not stop_event.is_set():
+            wait = max(0.0, next_refresh - time.time())
+            refresh_event.wait(wait)
+            refresh_event.clear()
+            if stop_event.is_set():
+                break
+            with state_lock:
+                current_state = state
+            with control_lock:
+                local_show_threads = show_threads
+                local_recording_enabled = recording_enabled
+                local_record_session = record_session
+            rank_to_proc, _pid_errors = collect_rank_pids(current_state)
+            candidate = best_selector_from_procs(rank_to_proc.values())
+            if candidate and selector_score(candidate) > selector_score(current_state.selector):
+                with state_lock:
+                    if selector_score(candidate) > selector_score(state.selector):
+                        state = dataclasses.replace(state, selector=candidate)
+                        current_state = state
+            snapshots, _stack_errors = collect_stacks(
+                current_state, rank_to_proc, pythonpath, local_show_threads, install_attempted
+            )
+            if local_recording_enabled and local_record_session is not None:
+                local_record_session.record_if_changed(current_state, rank_to_proc, snapshots)
+            with data_lock:
+                latest_data.rank_to_proc = rank_to_proc
+                latest_data.snapshots = snapshots
+                latest_data.last_update = time.strftime("%H:%M:%S")
+                latest_data.version += 1
+            next_refresh = time.time() + refresh
+
     def refresh_view() -> None:
         nonlocal last_update, state, record_session
-        rank_to_proc, _pid_errors = collect_rank_pids(state)
-        candidate = best_selector_from_procs(rank_to_proc.values())
-        if candidate and selector_score(candidate) > selector_score(state.selector):
-            state = dataclasses.replace(state, selector=candidate)
-        snapshots, _stack_errors = collect_stacks(
-            state, rank_to_proc, pythonpath, show_threads, install_attempted
-        )
-        if recording_enabled and record_session is not None:
-            record_session.record_if_changed(state, rank_to_proc, snapshots)
+        with data_lock:
+            rank_to_proc = latest_data.rank_to_proc
+            snapshots = latest_data.snapshots
+            last_update = latest_data.last_update
+        with state_lock:
+            current_state = state
+        with control_lock:
+            local_show_threads = show_threads
         stacks_text: Dict[int, Text] = {}
-        stack_lines_by_rank = {
-            rank: extract_stack_lines(snapshot.stack_lines)
-            for rank, snapshot in snapshots.items()
-        }
+        stack_lines_by_rank: Dict[int, List[str]] = {}
+        lines_by_rank: Dict[int, List[str]] = {}
+        details_by_rank: Dict[int, List[str]] = {}
+        for entry in current_state.ranks:
+            snapshot = snapshots.get(entry.rank)
+            if snapshot is None:
+                lines = ["No data"]
+                details = []
+            elif snapshot.output is not None:
+                lines, details = render_pyspy_output(snapshot.output, local_show_threads)
+            elif snapshot.error:
+                lines = [snapshot.error]
+                details = []
+            else:
+                lines = snapshot.stack_lines
+                details = snapshot.details
+            lines_by_rank[entry.rank] = lines
+            details_by_rank[entry.rank] = details
+            stack_lines_by_rank[entry.rank] = extract_stack_lines(lines)
         prefix_len = common_prefix_length(stack_lines_by_rank)
         diff_index = None
         if any(stack_lines_by_rank.values()):
             diff_index = max(0, prefix_len - 1) if prefix_len > 0 else 0
-        for rank, snapshot in snapshots.items():
-            lines = snapshot.stack_lines
+        for rank, lines in lines_by_rank.items():
             marked = mark_diff_line(lines, diff_index) if diff_index is not None else lines
             stacks_text[rank] = style_lines(marked)
-        details_by_rank = {
-            rank: snapshot.details for rank, snapshot in snapshots.items()
-        }
-        last_update = time.strftime("%H:%M:%S")
         width, height = shutil.get_terminal_size((120, 40))
         content_width = max(0, width - 4)
         record_line = None
-        if record_session is not None and recording_enabled:
-            record_line = f"{record_session.log_path} | events {record_session.event_count} | {format_elapsed(record_started_at)}"
+        with control_lock:
+            local_record_session = record_session
+            local_recording_enabled = recording_enabled
+            local_record_started_at = record_started_at
+        if local_record_session is not None and local_recording_enabled:
+            record_line = (
+                f"{local_record_session.log_path} | "
+                f"events {local_record_session.event_count} | "
+                f"{format_elapsed(local_record_started_at)}"
+            )
             record_line = shorten(record_line, max(10, content_width - 12))
         header, header_lines = build_live_header(
-            state, last_update, refresh, record_line, content_width
+            current_state, last_update, refresh, record_line, content_width
         )
         header_height = header_lines + 2
         header_height = max(3, min(header_height, max(3, height - 1)))
         layout["header"].size = header_height
         body_height = max(1, height - header_height)
-        total_columns = len(state.ranks) + (1 if show_details else 0)
+        total_columns = len(current_state.ranks) + (1 if show_details else 0)
         column_width = max(1, content_width // max(1, total_columns))
         inner_width = max(1, column_width - 4)
         details_text = (
-            build_details_text(state.ranks, rank_to_proc, details_by_rank, inner_width)
+            build_details_text(current_state.ranks, rank_to_proc, details_by_rank, inner_width)
             if show_details
             else None
         )
@@ -2432,63 +2505,81 @@ def run_live(args: argparse.Namespace) -> int:
             Panel(header, padding=(0, 1), border_style=BORDER_STYLE)
         )
         layout["body"].update(
-            render_columns(state.ranks, stacks_text, details_text, body_height, rank_to_proc)
+            render_columns(current_state.ranks, stacks_text, details_text, body_height, rank_to_proc)
         )
 
     def handle_keypress(key: str) -> Optional[int]:
-        nonlocal next_refresh, show_threads, show_details, recording_enabled
+        nonlocal show_threads, show_details, recording_enabled, next_render
         if key == "q":
             return 0
         if key == " ":
-            next_refresh = 0.0
+            refresh_event.set()
+            next_render = 0.0
             return None
         if key == "t":
-            show_threads = not show_threads
-            next_refresh = 0.0
+            with control_lock:
+                show_threads = not show_threads
+            next_render = 0.0
             return None
         if key == "d":
             show_details = not show_details
-            next_refresh = 0.0
+            next_render = 0.0
             return None
         if key == "r":
-            if recording_enabled:
+            with control_lock:
+                enabled = recording_enabled
+            if enabled:
                 stop_recording()
             else:
                 start_recording()
-            next_refresh = 0.0
+            next_render = 0.0
             return None
         return None
 
+    def maybe_refresh(force: bool = False) -> None:
+        nonlocal next_render, seen_version
+        now = time.time()
+        with data_lock:
+            current_version = latest_data.version
+        if force or current_version != seen_version or now >= next_render:
+            refresh_view()
+            seen_version = current_version
+            next_render = now + render_interval
+
     try:
-        refresh_view()
-        next_refresh = time.time() + refresh
+        collector_thread = threading.Thread(target=collect_loop, name="mpiptop-collector", daemon=True)
+        collector_thread.start()
+        maybe_refresh(force=True)
         with Live(layout, console=console, refresh_per_second=10, screen=True):
             while True:
-                now = time.time()
                 key = read_key(0.0)
                 if key is not None:
                     result = handle_keypress(key)
+                    maybe_refresh(force=True)
                     if result is not None:
                         return result
                     continue
 
-                if now >= next_refresh:
-                    refresh_view()
-                    next_refresh = time.time() + refresh
-                    continue
+                maybe_refresh()
 
-                wait = min(0.1, max(0.0, next_refresh - now))
+                wait = min(0.1, max(0.0, next_render - time.time()))
                 key = read_key(wait)
                 if key is None:
                     continue
                 result = handle_keypress(key)
+                maybe_refresh(force=True)
                 if result is not None:
                     return result
     except KeyboardInterrupt:
         return 0
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        if record_session is not None:
+        stop_event.set()
+        refresh_event.set()
+        if collector_thread is not None:
+            collector_thread.join(timeout=refresh + 2)
+        worker_alive = collector_thread is not None and collector_thread.is_alive()
+        if record_session is not None and not worker_alive:
             record_session.close()
             if record_session.event_count > 0:
                 print(f"Recording saved to: {record_session.log_path}")
