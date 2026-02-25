@@ -581,6 +581,186 @@ def find_rankfile_path(args: str) -> Optional[str]:
     return None
 
 
+def split_args(args: str) -> List[str]:
+    if not args:
+        return []
+    try:
+        return shlex.split(args)
+    except ValueError:
+        return args.split()
+
+
+def parse_int(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def parse_hostlist(raw: str) -> List[Tuple[str, int, bool]]:
+    specs: List[Tuple[str, int, bool]] = []
+    if not raw:
+        return specs
+    for token in re.split(r"[,\s]+", raw.strip()):
+        if not token:
+            continue
+        host = token
+        slots = 1
+        explicit = False
+        if ":" in token:
+            base, rest = token.split(":", 1)
+            if rest.isdigit():
+                host = base
+                slots = int(rest)
+                explicit = True
+        specs.append((host, slots, explicit))
+    return specs
+
+
+def parse_hostfile(path: str) -> List[Tuple[str, int, bool]]:
+    if not path:
+        return []
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        return []
+    specs: List[Tuple[str, int, bool]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.split()
+                host_token = parts[0]
+                host = host_token
+                slots: Optional[int] = None
+                explicit = False
+                if ":" in host_token:
+                    base, rest = host_token.split(":", 1)
+                    if rest.isdigit():
+                        host = base
+                        slots = int(rest)
+                        explicit = True
+                    else:
+                        host = host_token
+                for token in parts[1:]:
+                    if token.startswith("slots="):
+                        value = token.split("=", 1)[1]
+                        if value.isdigit():
+                            slots = int(value)
+                            explicit = True
+                    elif token.startswith("max-slots=") and slots is None:
+                        value = token.split("=", 1)[1]
+                        if value.isdigit():
+                            slots = int(value)
+                            explicit = True
+                    elif token.isdigit() and slots is None:
+                        slots = int(token)
+                        explicit = True
+                if slots is None:
+                    slots = 1
+                specs.append((host, slots, explicit))
+    except OSError:
+        return []
+    return specs
+
+
+def coalesce_host_specs(specs: Sequence[Tuple[str, int, bool]]) -> List[Tuple[str, int, bool]]:
+    merged: Dict[str, Tuple[int, bool]] = {}
+    order: List[str] = []
+    for host, slots, explicit in specs:
+        if host not in merged:
+            order.append(host)
+            merged[host] = (slots, explicit)
+        else:
+            prev_slots, prev_explicit = merged[host]
+            merged[host] = (prev_slots + slots, True)
+    return [(host, merged[host][0], merged[host][1]) for host in order]
+
+
+def parse_map_by_ppr(value: str) -> Optional[int]:
+    if not value:
+        return None
+    match = re.search(r"ppr:(\d+):node", value)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def parse_mpirun_host_specs(
+    args: str,
+) -> Tuple[List[Tuple[str, int, bool]], Optional[int], Optional[int], Optional[str]]:
+    tokens = split_args(args)
+    hostfiles: List[str] = []
+    hostlists: List[str] = []
+    num_ranks: Optional[int] = None
+    ppn: Optional[int] = None
+
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token in ("--hostfile", "-hostfile", "--machinefile", "-machinefile", "-f"):
+            if idx + 1 < len(tokens):
+                hostfiles.append(tokens[idx + 1])
+                idx += 1
+        elif token.startswith("--hostfile=") or token.startswith("--machinefile="):
+            hostfiles.append(token.split("=", 1)[1])
+        elif token.startswith("-hostfile=") or token.startswith("-machinefile="):
+            hostfiles.append(token.split("=", 1)[1])
+        elif token in ("-H", "--host", "-host", "--hosts", "-hosts"):
+            if idx + 1 < len(tokens):
+                hostlists.append(tokens[idx + 1])
+                idx += 1
+        elif token.startswith("-H") and token != "-H":
+            hostlists.append(token[2:])
+        elif token.startswith("--host=") or token.startswith("--hosts="):
+            hostlists.append(token.split("=", 1)[1])
+        elif token in ("-n", "-np", "--np", "--n"):
+            if idx + 1 < len(tokens):
+                num_ranks = parse_int(tokens[idx + 1]) or num_ranks
+                idx += 1
+        elif re.match(r"^-n\d+$", token):
+            num_ranks = int(token[2:])
+        elif re.match(r"^-np\d+$", token):
+            num_ranks = int(token[3:])
+        elif token in ("-ppn", "--ppn", "-npernode", "--npernode"):
+            if idx + 1 < len(tokens):
+                ppn = parse_int(tokens[idx + 1]) or ppn
+                idx += 1
+        elif re.match(r"^-ppn\d+$", token):
+            ppn = int(token[4:])
+        elif token.startswith("-npernode") and token != "-npernode":
+            suffix = token[len("-npernode") :]
+            if suffix.isdigit():
+                ppn = int(suffix)
+        elif token == "--map-by":
+            if idx + 1 < len(tokens):
+                ppn = parse_map_by_ppr(tokens[idx + 1]) or ppn
+                idx += 1
+        elif token.startswith("--map-by="):
+            ppn = parse_map_by_ppr(token.split("=", 1)[1]) or ppn
+        idx += 1
+
+    specs: List[Tuple[str, int, bool]] = []
+    source: Optional[str] = None
+    for path in hostfiles:
+        if not path:
+            continue
+        specs = parse_hostfile(path)
+        if specs:
+            source = f"hostfile:{path}"
+            break
+    if not specs and hostlists:
+        raw = ",".join([value for value in hostlists if value])
+        specs = parse_hostlist(raw)
+        if specs:
+            source = f"hostlist:{raw}"
+    specs = coalesce_host_specs(specs)
+    return specs, num_ranks, ppn, source
+
+
 def parse_rankfile(path: str) -> List[RankInfo]:
     if not os.path.exists(path):
         raise SystemExit(f"rankfile not found: {path}")
@@ -2078,6 +2258,134 @@ def distribute_tasks(num_tasks: int, num_nodes: int) -> List[int]:
     return counts
 
 
+def parse_lsb_mcpu_hosts(raw: str) -> List[Tuple[str, int, bool]]:
+    parts = raw.split()
+    specs: List[Tuple[str, int, bool]] = []
+    idx = 0
+    while idx < len(parts):
+        host = parts[idx]
+        slots = 1
+        explicit = False
+        if idx + 1 < len(parts) and parts[idx + 1].isdigit():
+            slots = int(parts[idx + 1])
+            explicit = True
+            idx += 2
+        else:
+            idx += 1
+        specs.append((host, slots, explicit))
+    return specs
+
+
+def detect_total_ranks_from_env() -> Optional[int]:
+    for key in ("SLURM_NTASKS", "PBS_NP", "LSB_DJOB_NUMPROC", "COBALT_JOBSIZE"):
+        value = os.environ.get(key)
+        if value and value.isdigit():
+            return int(value)
+    return None
+
+
+def resolve_hosts_from_env() -> Tuple[List[Tuple[str, int, bool]], Optional[int], Optional[int], Optional[str]]:
+    hostfile_envs = (
+        "OMPI_MCA_orte_default_hostfile",
+        "OMPI_MCA_hostfile",
+        "I_MPI_HYDRA_HOST_FILE",
+        "HYDRA_HOST_FILE",
+        "MPI_HOSTFILE",
+        "PBS_NODEFILE",
+        "COBALT_NODEFILE",
+        "LSB_DJOB_HOSTFILE",
+        "PE_HOSTFILE",
+    )
+    for key in hostfile_envs:
+        path = os.environ.get(key)
+        if not path:
+            continue
+        specs = coalesce_host_specs(parse_hostfile(path))
+        if specs:
+            return specs, detect_total_ranks_from_env(), None, f"env:{key}={path}"
+
+    raw = os.environ.get("LSB_MCPU_HOSTS")
+    if raw:
+        specs = coalesce_host_specs(parse_lsb_mcpu_hosts(raw))
+        if specs:
+            return specs, detect_total_ranks_from_env(), None, "env:LSB_MCPU_HOSTS"
+
+    raw = os.environ.get("LSB_HOSTS")
+    if raw:
+        specs = coalesce_host_specs(parse_hostlist(raw))
+        if specs:
+            return specs, detect_total_ranks_from_env(), None, "env:LSB_HOSTS"
+
+    raw = os.environ.get("OMPI_MCA_ras_base_hosts")
+    if raw:
+        specs = coalesce_host_specs(parse_hostlist(raw))
+        if specs:
+            return specs, detect_total_ranks_from_env(), None, "env:OMPI_MCA_ras_base_hosts"
+
+    nodelist = os.environ.get("SLURM_NODELIST") or os.environ.get("SLURM_JOB_NODELIST")
+    if nodelist:
+        hosts: List[str] = []
+        try:
+            hosts = expand_slurm_nodelist(nodelist)
+        except SystemExit:
+            hosts = []
+        if hosts:
+            tasks_per_node = parse_tasks_per_node(os.environ.get("SLURM_TASKS_PER_NODE", ""))
+            if tasks_per_node and len(tasks_per_node) == len(hosts):
+                specs = [(host, count, True) for host, count in zip(hosts, tasks_per_node)]
+            else:
+                specs = [(host, 1, False) for host in hosts]
+            return specs, detect_total_ranks_from_env(), None, "env:SLURM_NODELIST"
+
+    return [], None, None, None
+
+
+def host_specs_to_ranks(
+    specs: Sequence[Tuple[str, int, bool]],
+    total_ranks: Optional[int] = None,
+    ppn: Optional[int] = None,
+) -> List[RankInfo]:
+    if not specs:
+        return []
+    merged = coalesce_host_specs(specs)
+    hosts = [host for host, _slots, _explicit in merged]
+    counts = [max(0, slots) for _host, slots, _explicit in merged]
+    explicit = [flag for _host, _slots, flag in merged]
+    any_explicit = any(explicit)
+
+    if ppn and ppn > 0 and not any_explicit:
+        counts = [ppn] * len(counts)
+        any_explicit = True
+
+    if total_ranks and total_ranks > 0:
+        if not any_explicit:
+            counts = distribute_tasks(total_ranks, len(counts))
+        else:
+            total = sum(counts)
+            if total < total_ranks:
+                extra = distribute_tasks(total_ranks - total, len(counts))
+                counts = [base + add for base, add in zip(counts, extra)]
+            elif total > total_ranks:
+                remaining = total_ranks
+                trimmed: List[int] = []
+                for count in counts:
+                    if remaining <= 0:
+                        trimmed.append(0)
+                        continue
+                    use = min(count, remaining)
+                    trimmed.append(use)
+                    remaining -= use
+                counts = trimmed
+
+    ranks: List[RankInfo] = []
+    rank_id = 0
+    for host, count in zip(hosts, counts):
+        for _ in range(max(0, count)):
+            ranks.append(RankInfo(rank=rank_id, host=host))
+            rank_id += 1
+    return ranks
+
+
 def slurm_job_to_ranks(job_id: str) -> List[RankInfo]:
     info = run_scontrol_show_job(job_id)
     nodelist = info.get("NodeList") or info.get("Nodes")
@@ -2169,21 +2477,42 @@ def detect_state(args: argparse.Namespace) -> State:
 
     if prte is not None:
         rankfile = args.rankfile or find_rankfile_path(prte.args)
-        if not rankfile:
-            raise SystemExit("rankfile not found in prterun/mpirun args")
-        ranks = parse_rankfile(rankfile)
-        children = build_children_map(procs)
-        descendants = find_descendants(children, prte.pid)
-        program_proc = select_program(procs, descendants)
-        selector = parse_python_selector(program_proc.args if program_proc else "")
-        return State(
-            launcher="prte",
-            prte_pid=prte.pid,
-            slurm_job_id=None,
-            rankfile=rankfile,
-            ranks=ranks,
-            selector=selector,
-        )
+        if rankfile:
+            ranks = parse_rankfile(rankfile)
+            children = build_children_map(procs)
+            descendants = find_descendants(children, prte.pid)
+            program_proc = select_program(procs, descendants)
+            selector = parse_python_selector(program_proc.args if program_proc else "")
+            return State(
+                launcher="prte",
+                prte_pid=prte.pid,
+                slurm_job_id=None,
+                rankfile=rankfile,
+                ranks=ranks,
+                selector=selector,
+            )
+
+        host_specs, num_ranks, ppn, source = parse_mpirun_host_specs(prte.args)
+        if not host_specs:
+            host_specs, num_ranks, ppn, source = resolve_hosts_from_env()
+        if host_specs:
+            ranks = host_specs_to_ranks(host_specs, num_ranks, ppn)
+            if not ranks:
+                raise SystemExit("no ranks parsed from mpirun host list")
+            children = build_children_map(procs)
+            descendants = find_descendants(children, prte.pid)
+            program_proc = select_program(procs, descendants)
+            selector = parse_python_selector(program_proc.args if program_proc else "")
+            return State(
+                launcher="prte",
+                prte_pid=prte.pid,
+                slurm_job_id=None,
+                rankfile=source or "hosts",
+                ranks=ranks,
+                selector=selector,
+            )
+
+        raise SystemExit("rankfile/hostfile/hostlist not found in prterun/mpirun args")
 
     slurm_job_id = resolve_slurm_job_id(args)
     if slurm_job_id:
