@@ -97,6 +97,7 @@ class LiveData:
     snapshots: Dict[int, RankSnapshot] = dataclasses.field(default_factory=dict)
     last_update: str = "never"
     version: int = 0
+    collected: bool = False
 
 
 @dataclasses.dataclass
@@ -2199,11 +2200,14 @@ def parse_scontrol_kv(line: str) -> Dict[str, str]:
 
 
 def run_scontrol_show_job(job_id: str) -> Dict[str, str]:
-    result = subprocess.run(
-        ["scontrol", "show", "job", "-o", str(job_id)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "job", "-o", str(job_id)],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"scontrol not found while resolving slurm job {job_id}") from exc
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise SystemExit(f"scontrol show job failed for {job_id}: {stderr or 'unknown error'}")
@@ -2214,11 +2218,14 @@ def run_scontrol_show_job(job_id: str) -> Dict[str, str]:
 
 
 def expand_slurm_nodelist(nodelist: str) -> List[str]:
-    result = subprocess.run(
-        ["scontrol", "show", "hostnames", nodelist],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "hostnames", nodelist],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit("scontrol not found while expanding slurm nodelist") from exc
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise SystemExit(f"scontrol show hostnames failed: {stderr or 'unknown error'}")
@@ -2423,11 +2430,14 @@ def resolve_slurm_job_id(args: argparse.Namespace) -> Optional[str]:
     user = os.environ.get("USER")
     if not user:
         return None
-    result = subprocess.run(
-        ["squeue", "-u", user, "-h", "-t", "R", "-o", "%i"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["squeue", "-u", user, "-h", "-t", "R", "-o", "%i"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
     if result.returncode != 0:
         return None
     jobs = [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -2440,11 +2450,14 @@ def describe_slurm_jobs() -> str:
     user = os.environ.get("USER")
     if not user:
         return ""
-    result = subprocess.run(
-        ["squeue", "-u", user, "-h", "-o", "%i %t %j %R"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["squeue", "-u", user, "-h", "-o", "%i %t %j %R"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
     if result.returncode != 0:
         return ""
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -2456,11 +2469,14 @@ def describe_slurm_jobs() -> str:
 def is_slurm_job_alive(job_id: Optional[str]) -> bool:
     if not job_id:
         return False
-    result = subprocess.run(
-        ["squeue", "-j", str(job_id), "-h", "-o", "%t"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["squeue", "-j", str(job_id), "-h", "-o", "%t"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False
     if result.returncode != 0:
         return False
     state = (result.stdout or "").strip()
@@ -2513,6 +2529,18 @@ def detect_state(args: argparse.Namespace) -> State:
             )
 
         raise SystemExit("rankfile/hostfile/hostlist not found in prterun/mpirun args")
+
+    if args.rankfile:
+        ranks = parse_rankfile(args.rankfile)
+        selector = ProgramSelector(module=None, script=None, display="")
+        return State(
+            launcher="rankfile",
+            prte_pid=0,
+            slurm_job_id=None,
+            rankfile=args.rankfile,
+            ranks=ranks,
+            selector=selector,
+        )
 
     slurm_job_id = resolve_slurm_job_id(args)
     if slurm_job_id:
@@ -2671,6 +2699,28 @@ def parse_record_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
     return args
 
 
+def parse_once_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Print one mpiptop snapshot to stdout.")
+    parser.add_argument("--rankfile", help="Override rankfile path")
+    parser.add_argument("--prterun-pid", type=int, help="PID of prterun/mpirun")
+    parser.add_argument("--slurm-job", help="Slurm job ID to inspect")
+    parser.add_argument(
+        "--pythonpath",
+        help="PYTHONPATH to export remotely (defaults to local PYTHONPATH)",
+    )
+    parser.add_argument(
+        "--threads",
+        action="store_true",
+        help="Include all threads (default: main thread only)",
+    )
+    parser.add_argument(
+        "--details",
+        action="store_true",
+        help="Include py-spy detail lines",
+    )
+    return parser.parse_args(argv)
+
+
 def run_live(args: argparse.Namespace) -> int:
     pythonpath = args.pythonpath if args.pythonpath is not None else os.environ.get("PYTHONPATH", "")
 
@@ -2762,6 +2812,7 @@ def run_live(args: argparse.Namespace) -> int:
                 latest_data.snapshots = snapshots
                 latest_data.last_update = time.strftime("%H:%M:%S")
                 latest_data.version += 1
+                latest_data.collected = True
             next_refresh = time.time() + refresh
 
     def refresh_view() -> None:
@@ -2770,6 +2821,7 @@ def run_live(args: argparse.Namespace) -> int:
             rank_to_proc = latest_data.rank_to_proc
             snapshots = latest_data.snapshots
             last_update = latest_data.last_update
+            collected = latest_data.collected
         with state_lock:
             current_state = state
         with control_lock:
@@ -2781,7 +2833,7 @@ def run_live(args: argparse.Namespace) -> int:
         for entry in current_state.ranks:
             snapshot = snapshots.get(entry.rank)
             if snapshot is None:
-                lines = ["No data"]
+                lines = ["Collecting data..."] if not collected else ["No data"]
                 details = []
             elif snapshot.output is not None:
                 lines, details = render_pyspy_output(snapshot.output, local_show_threads)
@@ -2944,7 +2996,7 @@ def run_record_batch(args: argparse.Namespace) -> int:
                 if not is_pid_alive(state.prte_pid):
                     stop_reason = "prterun-exited"
                     break
-            else:
+            elif state.launcher == "slurm":
                 if not is_slurm_job_alive(state.slurm_job_id):
                     stop_reason = "slurm-job-exited"
                     break
@@ -2990,6 +3042,69 @@ def run_record_batch(args: argparse.Namespace) -> int:
         )
 
     return 0
+
+
+def format_once_output(
+    state: State,
+    rank_to_proc: Dict[int, RankProcess],
+    snapshots: Dict[int, RankSnapshot],
+    pid_errors: Sequence[str],
+    stack_errors: Sequence[str],
+    show_details: bool,
+) -> str:
+    lines: List[str] = []
+    target = state.selector.display or "python"
+    lines.append(
+        f"mpiptop once | {iso_timestamp()} | launcher={state.launcher} | "
+        f"ranks={len(state.ranks)} | target={shorten(target, 120)}"
+    )
+    if state.rankfile:
+        lines.append(f"rankfile: {state.rankfile}")
+    if pid_errors or stack_errors:
+        lines.append("errors:")
+        for err in list(pid_errors) + list(stack_errors):
+            lines.append(f"- {err}")
+    for entry in state.ranks:
+        proc = rank_to_proc.get(entry.rank)
+        title = f"rank {entry.rank} @ {entry.host}"
+        if proc is not None:
+            title = f"{title} | pid {proc.pid}"
+            if proc.rss_kb is not None:
+                title = f"{title} | {format_rss(proc.rss_kb)}"
+        lines.append(title)
+        snapshot = snapshots.get(entry.rank)
+        if snapshot is None:
+            lines.append("No data")
+        elif snapshot.error:
+            lines.append(snapshot.error)
+        elif snapshot.stack_lines:
+            lines.extend(snapshot.stack_lines)
+        else:
+            lines.append("No data")
+        if show_details and snapshot is not None and snapshot.details:
+            lines.append("-- details --")
+            lines.extend(snapshot.details)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def run_once(args: argparse.Namespace) -> int:
+    pythonpath = args.pythonpath if args.pythonpath is not None else os.environ.get("PYTHONPATH", "")
+    state = detect_state(args)
+    rank_to_proc, pid_errors = collect_rank_pids(state)
+    snapshots, stack_errors = collect_stacks(
+        state, rank_to_proc, pythonpath, bool(args.threads), set()
+    )
+    output = format_once_output(
+        state,
+        rank_to_proc,
+        snapshots,
+        pid_errors,
+        stack_errors,
+        bool(args.details),
+    )
+    print(output)
+    return 1 if pid_errors or stack_errors else 0
 
 
 def run_review(args: argparse.Namespace) -> int:
@@ -3275,13 +3390,15 @@ def run_summarize(args: argparse.Namespace) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
-    if argv and argv[0] in {"review", "summarize", "record"}:
+    if argv and argv[0] in {"review", "summarize", "record", "once"}:
         command = argv[0]
         sub_args = argv[1:]
         if command == "review":
             return run_review(parse_review_args(sub_args))
         if command == "record":
             return run_record_batch(parse_record_args(sub_args))
+        if command == "once":
+            return run_once(parse_once_args(sub_args))
         return run_summarize(parse_summarize_args(sub_args))
     return run_live(parse_live_args(argv))
 
